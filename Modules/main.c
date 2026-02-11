@@ -30,6 +30,24 @@
     "Type \"help\", \"copyright\", \"credits\" or \"license\" " \
     "for more information."
 
+
+/* File-local variables that persist through Wizer snapshots */
+#define NO_SNAPSHOT     -1
+#define CREATE_SNAPSHOT 0
+#define RUN_SNAPSHOT    1
+
+static int SNAPSHOT_STATE = NO_SNAPSHOT;
+
+/* State of pymain_{create,run}_snapshot() */
+static PyObject *SNAPSHOT_CALLABLE = NULL;
+
+/* State of pymain_run_python() */
+static PyObject *MAIN_IMPORTER_PATH = NULL;
+static PyInterpreterState *INTERP = NULL;
+
+
+
+
 /* --- pymain_init() ---------------------------------------------- */
 
 static PyStatus
@@ -609,11 +627,62 @@ pymain_repl(PyConfig *config, int *exitcode)
 }
 
 
+static int
+pymain_create_snapshot(void)
+{
+    /* TODO parametrize main module name */
+    PyObject *mod = PyImport_ImportModule("main");
+
+    PyObject *dict = PyModule_GetDict(mod);
+    assert(dict != NULL);
+
+    PyObject *key = PyUnicode_FromString("main");
+    assert(key != NULL);
+
+    if (!PyDict_Contains(dict, key)) {
+        printf("Imported module does not have a main function\n");
+        return 119;
+    }
+
+    PyObject *main = PyDict_GetItemWithError(dict, key);
+    assert(main != NULL);
+
+    SNAPSHOT_CALLABLE = main;
+    SNAPSHOT_STATE = RUN_SNAPSHOT;
+    return 0;
+}
+
+
+static int
+pymain_run_snapshot(void)
+{
+    if (SNAPSHOT_CALLABLE == NULL) {
+        printf("Snapshot was not initializedn");
+        return 119;
+    }
+
+    PyObject *res = PyObject_CallNoArgs(SNAPSHOT_CALLABLE);
+    SNAPSHOT_STATE = NO_SNAPSHOT;
+    return (res == NULL); /* TODO proper handling, deallocation */
+}
+
+
 static void
 pymain_run_python(int *exitcode)
 {
     PyObject *main_importer_path = NULL;
-    PyInterpreterState *interp = _PyInterpreterState_GET();
+    PyInterpreterState *interp = NULL;
+
+    if (SNAPSHOT_STATE == RUN_SNAPSHOT) {
+        main_importer_path = MAIN_IMPORTER_PATH;
+        interp = INTERP;
+
+        *exitcode = pymain_run_snapshot();
+
+        goto done;
+    }
+
+    interp = _PyInterpreterState_GET();
     /* pymain_run_stdin() modify the config */
     PyConfig *config = (PyConfig*)_PyInterpreterState_GetConfig(interp);
 
@@ -681,7 +750,15 @@ pymain_run_python(int *exitcode)
     _PyInterpreterState_SetRunningMain(interp);
     assert(!PyErr_Occurred());
 
-    if (config->run_command) {
+    if (SNAPSHOT_STATE == CREATE_SNAPSHOT) {
+        MAIN_IMPORTER_PATH = main_importer_path;
+        INTERP = interp;
+
+        *exitcode = pymain_create_snapshot();
+
+        return;
+    }
+    else if (config->run_command) {
         *exitcode = pymain_run_command(config->run_command);
     }
     else if (config->run_module) {
@@ -774,13 +851,16 @@ Py_RunMain(void)
 
     pymain_run_python(&exitcode);
 
-    if (Py_FinalizeEx() < 0) {
-        /* Value unlikely to be confused with a non-error exit status or
-           other special meaning */
-        exitcode = 120;
+    /* If we just created a snapshot, this is false and we don't free.
+       If we just ran a snapshot, it is true and we free. */
+    if (SNAPSHOT_STATE != RUN_SNAPSHOT) {
+        if (Py_FinalizeEx() < 0) {
+            /* Value unlikely to be confused with a non-error exit status or
+               other special meaning */
+            exitcode = 120;
+        }
+        pymain_free();
     }
-
-    pymain_free();
 
     if (_PyRuntime.signals.unhandled_keyboard_interrupt) {
         exitcode = exit_sigint();
@@ -793,13 +873,19 @@ Py_RunMain(void)
 static int
 pymain_main(_PyArgv *args)
 {
-    PyStatus status = pymain_init(args);
-    if (_PyStatus_IS_EXIT(status)) {
-        pymain_free();
-        return status.exitcode;
-    }
-    if (_PyStatus_EXCEPTION(status)) {
-        pymain_exit_error(status);
+    /* This means we don't process command line arguments when running
+       from a Snapshot. Since Wizer doesn't process command line arguments
+       we effectively never have meaningful command line arguments... */
+    if (SNAPSHOT_STATE != RUN_SNAPSHOT) {
+        PyStatus status = pymain_init(args);
+
+        if (_PyStatus_IS_EXIT(status)) {
+            pymain_free();
+            return status.exitcode;
+        }
+        if (_PyStatus_EXCEPTION(status)) {
+            pymain_exit_error(status);
+        }
     }
 
     return Py_RunMain();
@@ -827,4 +913,14 @@ Py_BytesMain(int argc, char **argv)
         .bytes_argv = argv,
         .wchar_argv = NULL};
     return pymain_main(&args);
+}
+
+
+int
+Py_WizerMain(void)
+{
+    SNAPSHOT_STATE = CREATE_SNAPSHOT;
+
+    /* We don't get argv from Wizer */
+    return pymain_main(NULL);
 }
