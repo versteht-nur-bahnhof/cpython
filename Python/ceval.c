@@ -50,6 +50,10 @@
 
 #include <stdbool.h>              // bool
 
+#ifdef __wasi__
+#include "weval.h"
+#endif
+
 #if !defined(Py_BUILD_CORE)
 #  error "ceval.c must be build with Py_BUILD_CORE define for best performance"
 #endif
@@ -1224,7 +1228,7 @@ _PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int 
 #   endif
 #else
     goto start_frame;
-#   include "generated_cases.c.h"
+#include "generated_cases.c.h"
 #endif
 
 

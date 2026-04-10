@@ -26,10 +26,10 @@
 #endif
 /* End of includes for exit_sigint() */
 
-#define COPYRIGHT \
-    "Type \"help\", \"copyright\", \"credits\" or \"license\" " \
-    "for more information."
-
+/* Includes for Weval */
+#ifdef __wasi__
+#include "weval.h"
+WEVAL_DEFINE_GLOBALS();
 
 /* File-local variables that persist through Wizer snapshots */
 #define NO_SNAPSHOT     -1
@@ -39,13 +39,17 @@
 static int SNAPSHOT_STATE = NO_SNAPSHOT;
 
 /* State of pymain_{create,run}_snapshot() */
-static PyObject *SNAPSHOT_CALLABLE = NULL;
+static PyObject *SNAPSHOT_MAIN = NULL;
+static weval_req_t *SNAPSHOT_REQUEST = NULL;
 
 /* State of pymain_run_python() */
 static PyObject *MAIN_IMPORTER_PATH = NULL;
 static PyInterpreterState *INTERP = NULL;
+#endif /* def __wasi__ */
 
-
+#define COPYRIGHT \
+    "Type \"help\", \"copyright\", \"credits\" or \"license\" " \
+    "for more information."
 
 
 /* --- pymain_init() ---------------------------------------------- */
@@ -626,6 +630,8 @@ pymain_repl(PyConfig *config, int *exitcode)
     return;
 }
 
+#ifdef __wasi__
+WEVAL_DEFINE_TARGET(1, PyObject_CallNoArgs);
 
 static int
 pymain_create_snapshot(void)
@@ -647,8 +653,30 @@ pymain_create_snapshot(void)
     PyObject *main = PyDict_GetItemWithError(dict, key);
     assert(main != NULL);
 
-    SNAPSHOT_CALLABLE = main;
+    /* Teardown code of init will see RUN_SNAPSHOT */
     SNAPSHOT_STATE = RUN_SNAPSHOT;
+    SNAPSHOT_MAIN = main;
+
+    weval_req_t *req = malloc(sizeof(weval_req_t));
+    weval_req_arg_t *arg = malloc(sizeof(weval_req_arg_t));
+
+    arg->specialize = 1;
+    arg->ty = weval_req_arg_i32;
+    arg->u.raw = 0;
+    arg->u.i32 = main;
+
+    req->next = NULL;
+    req->prev = NULL;
+    req->user_id = 1;
+    req->num_globals = 0;
+    req->func = (weval_func_t)&PyObject_CallNoArgs;
+    req->argbuf = arg;
+    req->arglen = sizeof(weval_req_arg_t);
+    req->specialized = NULL;
+
+    weval_request(req);
+    SNAPSHOT_REQUEST = req;
+
     return 0;
 }
 
@@ -656,15 +684,21 @@ pymain_create_snapshot(void)
 static int
 pymain_run_snapshot(void)
 {
-    if (SNAPSHOT_CALLABLE == NULL) {
-        printf("Snapshot was not initializedn");
-        return 119;
+    PyObject *res = NULL;
+
+    if (SNAPSHOT_REQUEST->specialized) {
+        res = (*(PyObject *(*)(void)) SNAPSHOT_REQUEST->specialized)();
+    }
+    else {
+        res = (*(PyObject *(*)(PyObject *)) SNAPSHOT_REQUEST->func)(SNAPSHOT_MAIN);
     }
 
-    PyObject *res = PyObject_CallNoArgs(SNAPSHOT_CALLABLE);
     SNAPSHOT_STATE = NO_SNAPSHOT;
-    return (res == NULL); /* TODO proper handling, deallocation */
+
+    /* TODO: deallocate module and function objects */
+    return (res == NULL);
 }
+#endif /* def __wasi__ */
 
 
 static void
@@ -673,6 +707,7 @@ pymain_run_python(int *exitcode)
     PyObject *main_importer_path = NULL;
     PyInterpreterState *interp = NULL;
 
+#ifdef __wasi__
     if (SNAPSHOT_STATE == RUN_SNAPSHOT) {
         main_importer_path = MAIN_IMPORTER_PATH;
         interp = INTERP;
@@ -681,6 +716,7 @@ pymain_run_python(int *exitcode)
 
         goto done;
     }
+#endif
 
     interp = _PyInterpreterState_GET();
     /* pymain_run_stdin() modify the config */
@@ -750,6 +786,7 @@ pymain_run_python(int *exitcode)
     _PyInterpreterState_SetRunningMain(interp);
     assert(!PyErr_Occurred());
 
+#ifdef __wasi__
     if (SNAPSHOT_STATE == CREATE_SNAPSHOT) {
         MAIN_IMPORTER_PATH = main_importer_path;
         INTERP = interp;
@@ -758,7 +795,9 @@ pymain_run_python(int *exitcode)
 
         return;
     }
-    else if (config->run_command) {
+#endif
+
+    if (config->run_command) {
         *exitcode = pymain_run_command(config->run_command);
     }
     else if (config->run_module) {
@@ -851,16 +890,21 @@ Py_RunMain(void)
 
     pymain_run_python(&exitcode);
 
-    /* If we just created a snapshot, this is false and we don't free.
-       If we just ran a snapshot, it is true and we free. */
-    if (SNAPSHOT_STATE != RUN_SNAPSHOT) {
-        if (Py_FinalizeEx() < 0) {
-            /* Value unlikely to be confused with a non-error exit status or
-               other special meaning */
-            exitcode = 120;
-        }
-        pymain_free();
+#ifdef __wasi__
+    /* This is true if we just created a snapshot, in which case
+       we can't free yet. */
+    if (SNAPSHOT_STATE == RUN_SNAPSHOT) {
+        return exitcode;
     }
+#endif
+
+    if (Py_FinalizeEx() < 0) {
+        /* Value unlikely to be confused with a non-error exit status or
+           other special meaning */
+        exitcode = 120;
+    }
+
+    pymain_free();
 
     if (_PyRuntime.signals.unhandled_keyboard_interrupt) {
         exitcode = exit_sigint();
@@ -873,19 +917,20 @@ Py_RunMain(void)
 static int
 pymain_main(_PyArgv *args)
 {
-    /* This means we don't process command line arguments when running
-       from a Snapshot. Since Wizer doesn't process command line arguments
-       we effectively never have meaningful command line arguments... */
-    if (SNAPSHOT_STATE != RUN_SNAPSHOT) {
-        PyStatus status = pymain_init(args);
+#ifdef __wasi__
+    if (SNAPSHOT_STATE == RUN_SNAPSHOT) {
+        return Py_RunMain();
+    }
+#endif
 
-        if (_PyStatus_IS_EXIT(status)) {
-            pymain_free();
-            return status.exitcode;
-        }
-        if (_PyStatus_EXCEPTION(status)) {
-            pymain_exit_error(status);
-        }
+    PyStatus status = pymain_init(args);
+
+    if (_PyStatus_IS_EXIT(status)) {
+        pymain_free();
+        return status.exitcode;
+    }
+    if (_PyStatus_EXCEPTION(status)) {
+        pymain_exit_error(status);
     }
 
     return Py_RunMain();
@@ -916,6 +961,7 @@ Py_BytesMain(int argc, char **argv)
 }
 
 
+#ifdef __wasi__
 int
 Py_WizerMain(void)
 {
@@ -924,3 +970,4 @@ Py_WizerMain(void)
     /* We don't get argv from Wizer */
     return pymain_main(NULL);
 }
+#endif
