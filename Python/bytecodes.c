@@ -5538,11 +5538,6 @@ dummy_func(
 #if Py_TAIL_CALL_INTERP
             int opcode;
 #endif
-
-#ifdef __wasi__
-
-            weval_push_context(next_instr);
-#endif
             DISPATCH();
         }
 

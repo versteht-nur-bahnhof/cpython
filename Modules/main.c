@@ -26,11 +26,7 @@
 #endif
 /* End of includes for exit_sigint() */
 
-/* Includes for Weval */
 #ifdef __wasi__
-#include "weval.h"
-WEVAL_DEFINE_GLOBALS();
-
 /* File-local variables that persist through Wizer snapshots */
 #define NO_SNAPSHOT     -1
 #define CREATE_SNAPSHOT 0
@@ -40,7 +36,6 @@ static int SNAPSHOT_STATE = NO_SNAPSHOT;
 
 /* State of pymain_{create,run}_snapshot() */
 static PyObject *SNAPSHOT_MAIN = NULL;
-static weval_req_t *SNAPSHOT_REQUEST = NULL;
 
 /* State of pymain_run_python() */
 static PyObject *MAIN_IMPORTER_PATH = NULL;
@@ -631,8 +626,6 @@ pymain_repl(PyConfig *config, int *exitcode)
 }
 
 #ifdef __wasi__
-WEVAL_DEFINE_TARGET(1, PyObject_CallNoArgs);
-
 static int
 pymain_create_snapshot(void)
 {
@@ -653,30 +646,8 @@ pymain_create_snapshot(void)
     PyObject *main = PyDict_GetItemWithError(dict, key);
     assert(main != NULL);
 
-    /* Teardown code of init will see RUN_SNAPSHOT */
-    SNAPSHOT_STATE = RUN_SNAPSHOT;
     SNAPSHOT_MAIN = main;
-
-    weval_req_t *req = malloc(sizeof(weval_req_t));
-    weval_req_arg_t *arg = malloc(sizeof(weval_req_arg_t));
-
-    arg->specialize = 1;
-    arg->ty = weval_req_arg_i32;
-    arg->u.raw = 0;
-    arg->u.i32 = main;
-
-    req->next = NULL;
-    req->prev = NULL;
-    req->user_id = 1;
-    req->num_globals = 0;
-    req->func = (weval_func_t)&PyObject_CallNoArgs;
-    req->argbuf = arg;
-    req->arglen = sizeof(weval_req_arg_t);
-    req->specialized = NULL;
-
-    weval_request(req);
-    SNAPSHOT_REQUEST = req;
-
+    SNAPSHOT_STATE = RUN_SNAPSHOT;
     return 0;
 }
 
@@ -684,19 +655,14 @@ pymain_create_snapshot(void)
 static int
 pymain_run_snapshot(void)
 {
-    PyObject *res = NULL;
-
-    if (SNAPSHOT_REQUEST->specialized) {
-        res = (*(PyObject *(*)(void)) SNAPSHOT_REQUEST->specialized)();
-    }
-    else {
-        res = (*(PyObject *(*)(PyObject *)) SNAPSHOT_REQUEST->func)(SNAPSHOT_MAIN);
+    if (SNAPSHOT_MAIN == NULL) {
+        printf("Snapshot was not initializedn");
+        return 119;
     }
 
+    PyObject *res = PyObject_CallNoArgs(SNAPSHOT_MAIN);
     SNAPSHOT_STATE = NO_SNAPSHOT;
-
-    /* TODO: deallocate module and function objects */
-    return (res == NULL);
+    return (res == NULL); /* TODO proper handling, deallocation */
 }
 #endif /* def __wasi__ */
 

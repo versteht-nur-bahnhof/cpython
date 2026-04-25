@@ -12521,12 +12521,6 @@ JUMP_TO_LABEL(error);
             #if Py_TAIL_CALL_INTERP
             int opcode;
             #endif
-
-            #ifdef __wasi__
-            _PyFrame_SetStackPointer(frame, stack_pointer);
-            weval_push_context(next_instr);
-            stack_pointer = _PyFrame_GetStackPointer(frame);
-            #endif
             DISPATCH();
         }
 
